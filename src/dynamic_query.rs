@@ -1,9 +1,10 @@
 use std::cell::UnsafeCell;
+use std::collections::HashSet;
 
 use bevy_ecs::archetype::{
-    Archetype, ArchetypeComponentId, ArchetypeEntity, ArchetypeGeneration, ArchetypeId, Archetypes,
+    Archetype, ArchetypeComponentId, ArchetypeEntity, ArchetypeId, Archetypes,
 };
-use bevy_ecs::component::{ComponentId, ComponentTicks, StorageType, Tick};
+use bevy_ecs::component::{ComponentId, StorageType, Tick};
 use bevy_ecs::prelude::*;
 use bevy_ecs::ptr::{Ptr, PtrMut, ThinSlicePtr, UnsafeCellDeref};
 use bevy_ecs::query::{Access, FilteredAccess, QueryEntityError};
@@ -547,18 +548,22 @@ impl<'w> ComponentFilterState<'w> {
             StorageType::SparseSet => match self.kind {
                 FilterKind::With(_) | FilterKind::Without(_) => true,
                 FilterKind::Changed(_) => {
-                    let ticks =
-                        self.change_detection
-                            .archetype_changed_ticks(self.storage_type, entity, table_row);
+                    let ticks = self.change_detection.archetype_changed_ticks(
+                        self.storage_type,
+                        entity,
+                        table_row,
+                    );
                     ticks.is_newer_than(
                         self.change_detection.last_change_tick,
                         self.change_detection.change_tick,
                     )
                 }
                 FilterKind::Added(_) => {
-                    let ticks =
-                        self.change_detection
-                            .archetype_added_ticks(self.storage_type, entity, table_row);
+                    let ticks = self.change_detection.archetype_added_ticks(
+                        self.storage_type,
+                        entity,
+                        table_row,
+                    );
                     ticks.is_newer_than(
                         self.change_detection.last_change_tick,
                         self.change_detection.change_tick,
@@ -623,13 +628,10 @@ pub struct DynamicQuery {
     component_fetches: Vec<FetchKind>,
     filters: Vec<FilterKind>,
 
-    archetype_generation: ArchetypeGeneration,
     // NOTE: we maintain both a TableId bitset and a vec because iterating the vec is faster
     matched_tables: FixedBitSet,
     matched_table_ids: Vec<TableId>,
-    // NOTE: we maintain both a ArchetypeId bitset and a vec because iterating the vec is faster
-    matched_archetypes: FixedBitSet,
-    matched_archetype_ids: Vec<ArchetypeId>,
+    matched_archetypes: HashSet<ArchetypeId>,
     #[allow(unused)]
     component_access: FilteredAccess<ComponentId>,
     archetype_component_access: Access<ArchetypeComponentId>,
@@ -663,11 +665,9 @@ impl DynamicQuery {
             component_fetches,
             filters,
             component_access,
-            archetype_generation: ArchetypeGeneration::initial(),
             matched_tables: Default::default(),
             matched_table_ids: Vec::new(),
             matched_archetypes: Default::default(),
-            matched_archetype_ids: Vec::new(),
             archetype_component_access: Default::default(),
         };
         query.update_archetypes(world);
@@ -697,13 +697,16 @@ impl DynamicQuery {
     pub fn update_archetypes(&mut self, world: &World) {
         self.validate_world(world);
         let archetypes = world.archetypes();
-        let new_generation = archetypes.generation();
-        let old_generation = std::mem::replace(&mut self.archetype_generation, new_generation);
-        let archetype_index_range = old_generation.value()..new_generation.value();
-
-        for archetype_index in archetype_index_range {
-            self.new_archetype(&archetypes[ArchetypeId::new(archetype_index)]);
+        for archetype in archetypes.iter() {
+            self.new_archetype(archetype);
         }
+        // let new_generation = archetypes.generation();
+        // let old_generation = std::mem::replace(&mut self.archetype_generation, new_generation);
+        // let archetype_index_range = old_generation.value()..new_generation.value();
+
+        // for archetype_index in archetype_index_range {
+        //     self.new_archetype(&archetypes[ArchetypeId::new(archetype_index)]);
+        // }
     }
 
     fn new_archetype(&mut self, archetype: &Archetype) {
@@ -719,11 +722,9 @@ impl DynamicQuery {
             self.filters.iter().for_each(|s| {
                 s.update_archetype_component_access(archetype, &mut self.archetype_component_access)
             });
-            let archetype_index = archetype.id().index();
-            if !self.matched_archetypes.contains(archetype_index) {
-                self.matched_archetypes.grow(archetype_index + 1);
-                self.matched_archetypes.set(archetype_index, true);
-                self.matched_archetype_ids.push(archetype.id());
+            let archetype_id = archetype.id();
+            if !self.matched_archetypes.contains(&archetype_id) {
+                self.matched_archetypes.insert(archetype_id);
             }
             let table_index = archetype.table_id().index();
             if !self.matched_tables.contains(table_index) {
@@ -835,10 +836,7 @@ impl DynamicQuery {
             .entities()
             .get(entity)
             .ok_or(QueryEntityError::NoSuchEntity(entity))?;
-        if !self
-            .matched_archetypes
-            .contains(location.archetype_id.index())
-        {
+        if !self.matched_archetypes.contains(&location.archetype_id) {
             return Err(QueryEntityError::QueryDoesNotMatch(entity));
         }
 
@@ -859,8 +857,8 @@ impl DynamicQuery {
         fetch.set_archetype(archetype, &world.storages().tables);
         filter.set_archetype(archetype, &world.storages().tables);
 
-        if filter.fetch(entity, location.index) {
-            Ok(fetch.fetch(entity, location.index))
+        if filter.fetch(entity, location.table_row.index()) {
+            Ok(fetch.fetch(entity, location.table_row.index()))
         } else {
             Err(QueryEntityError::QueryDoesNotMatch(entity))
         }
@@ -876,7 +874,7 @@ pub struct DynamicQueryIter<'w, 's> {
     fetch: ComponentFetchStates<'w>,
     filter: ComponentFilterStates<'w>,
     table_id_iter: std::slice::Iter<'s, TableId>,
-    archetype_id_iter: std::slice::Iter<'s, ArchetypeId>,
+    archetype_id_iter: std::collections::hash_set::Iter<'s, ArchetypeId>,
     current_len: usize,
     current_index: usize,
 }
@@ -910,7 +908,7 @@ impl<'w, 's> DynamicQueryIter<'w, 's> {
             fetch,
             filter,
             table_id_iter: query.matched_table_ids.iter(),
-            archetype_id_iter: query.matched_archetype_ids.iter(),
+            archetype_id_iter: query.matched_archetypes.iter(),
             current_len: 0,
             current_index: 0,
         }
@@ -972,18 +970,19 @@ impl<'w, 's> Iterator for DynamicQueryIter<'w, 's> {
                     // `current_index` is an archetype index row in range of the current archetype, because if it was not, then the if above would have been executed.
                     let archetype_entity =
                         self.archetype_entities.get_unchecked(self.current_index);
-                    if !self
-                        .filter
-                        .fetch(archetype_entity.entity(), archetype_entity.table_row())
-                    {
+                    if !self.filter.fetch(
+                        archetype_entity.entity(),
+                        archetype_entity.table_row().index(),
+                    ) {
                         self.current_index += 1;
                         continue;
                     }
 
                     let entity = self.fetch.entity(self.current_index);
-                    let items = self
-                        .fetch
-                        .fetch(archetype_entity.entity(), archetype_entity.table_row());
+                    let items = self.fetch.fetch(
+                        archetype_entity.entity(),
+                        archetype_entity.table_row().index(),
+                    );
 
                     self.current_index += 1;
 
