@@ -11,14 +11,20 @@ pub struct EcsValueRefQuery {
 }
 
 impl EcsValueRefQuery {
-    pub fn new(world: &World, components: &[ComponentId]) -> Self {
+    pub fn new(
+        world: &World,
+        with_components: &[ComponentId],
+        without_components: &[ComponentId],
+    ) -> Self {
+        let mut components: Vec<_> = with_components
+            .iter()
+            .map(|&id| FilterKind::With(id))
+            .collect();
+        components.extend(without_components.iter().map(|&id| FilterKind::Without(id)));
+
         Self {
-            query: DynamicQuery::new(
-                world,
-                vec![],
-                components.iter().map(|&id| FilterKind::With(id)).collect(),
-            )
-            .expect("dynamic query construction cannot fail because only filters are supplied"),
+            query: DynamicQuery::new(world, vec![], components)
+                .expect("dynamic query construction cannot fail because only filters are supplied"),
         }
     }
 
@@ -62,8 +68,9 @@ impl EcsValueRefQuery {
         self.query
             .filters()
             .iter()
-            .map(|filter| match *filter {
-                FilterKind::With(id) => id,
+            .flat_map(|filter| match *filter {
+                FilterKind::With(id) => Some(id),
+                FilterKind::Without(_) => None,
                 _ => unreachable!(),
             })
             .map(|component_id| {
@@ -158,7 +165,7 @@ mod tests {
             TestComponent2 { field: 5 },
         ));
 
-        let mut query = EcsValueRefQuery::new(&world, &[component_id_1, component_id_2]);
+        let mut query = EcsValueRefQuery::new(&world, &[component_id_1, component_id_2], &[]);
         let results: Vec<_> = query.iter(&world).collect();
         assert_eq!(results.len(), 1);
 
@@ -180,5 +187,59 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn iter_without() {
+        let mut world = World::new();
+
+        let component_id_1 = world.init_component::<TestComponent1>();
+        let component_id_2 = world.init_component::<TestComponent2>();
+
+        let type_registry = world.get_resource_or_insert_with(AppTypeRegistry::default);
+        {
+            let mut type_registry = type_registry.write();
+            type_registry.register::<TestComponent1>();
+            type_registry.register::<TestComponent2>();
+        }
+
+        world.spawn(TestComponent1 { value: "no".into() });
+        world.spawn((
+            TestComponent1 {
+                value: "yes".into(),
+            },
+            TestComponent2 { field: 5 },
+        ));
+
+        let mut query = EcsValueRefQuery::new(&world, &[component_id_1, component_id_2], &[]);
+        let results: Vec<_> = query.iter(&world).collect();
+        assert_eq!(results.len(), 1);
+
+        match results[0].items.as_slice() {
+            [a, b] => {
+                assert_eq!(a.component_id(), component_id_1);
+                assert_eq!(b.component_id(), component_id_2);
+
+                let a = ReflectValueRef::from(a.clone());
+                assert_eq!(
+                    a.append_path(".value", &world)
+                        .unwrap()
+                        .get(&world)
+                        .unwrap()
+                        .downcast_ref::<String>()
+                        .unwrap(),
+                    "yes"
+                )
+            }
+            _ => unreachable!(),
+        }
+
+        let mut query = EcsValueRefQuery::new(&world, &[], &[component_id_1]);
+        let results: Vec<_> = query.iter(&world).collect();
+        assert_eq!(results.len(), 0);
+
+        let mut query = EcsValueRefQuery::new(&world, &[], &[component_id_2]);
+        let results: Vec<_> = query.iter(&world).collect();
+        assert_eq!(results.len(), 1);
     }
 }
