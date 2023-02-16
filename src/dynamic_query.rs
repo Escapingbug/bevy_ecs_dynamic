@@ -3,7 +3,7 @@ use std::cell::UnsafeCell;
 use bevy_ecs::archetype::{
     Archetype, ArchetypeComponentId, ArchetypeEntity, ArchetypeGeneration, ArchetypeId, Archetypes,
 };
-use bevy_ecs::component::{ComponentId, ComponentTicks, StorageType};
+use bevy_ecs::component::{ComponentId, ComponentTicks, StorageType, Tick};
 use bevy_ecs::prelude::*;
 use bevy_ecs::ptr::{Ptr, PtrMut, ThinSlicePtr, UnsafeCellDeref};
 use bevy_ecs::query::{Access, FilteredAccess, QueryEntityError};
@@ -38,7 +38,8 @@ pub enum FetchResult<'w> {
     Ref(Ptr<'w>),
     RefMut {
         value: PtrMut<'w>,
-        ticks: &'w mut ComponentTicks,
+        changed_ticks: &'w mut Tick,
+        added_ticks: &'w mut Tick,
         last_change_tick: u32,
         change_tick: u32,
     },
@@ -183,7 +184,8 @@ struct ComponentFetchState<'w> {
     entity_table_rows: Option<ThinSlicePtr<'w, usize>>,
     sparse_set: Option<&'w ComponentSparseSet>,
 
-    table_ticks: Option<ThinSlicePtr<'w, UnsafeCell<ComponentTicks>>>,
+    table_added_ticks: Option<ThinSlicePtr<'w, UnsafeCell<Tick>>>,
+    table_changed_ticks: Option<ThinSlicePtr<'w, UnsafeCell<Tick>>>,
     last_change_tick: u32,
     change_tick: u32,
 
@@ -206,7 +208,8 @@ impl<'w> ComponentFetchState<'w> {
             table_components: None,
             entity_table_rows: None,
             sparse_set: None,
-            table_ticks: None,
+            table_added_ticks: None,
+            table_changed_ticks: None,
             last_change_tick,
             change_tick,
             fetch_kind,
@@ -223,7 +226,8 @@ impl<'w> ComponentFetchState<'w> {
                     .get_column(self.fetch_kind.component_id())
                     .unwrap();
                 self.table_components = Some(column.get_data_ptr());
-                self.table_ticks = Some(column.get_ticks_slice().into());
+                self.table_added_ticks = Some(column.get_added_ticks_slice().into());
+                self.table_changed_ticks = Some(column.get_changed_ticks_slice().into());
             }
             StorageType::SparseSet => {}
         }
@@ -233,22 +237,28 @@ impl<'w> ComponentFetchState<'w> {
     unsafe fn set_table(&mut self, table: &'w Table) {
         let column = table.get_column(self.fetch_kind.component_id()).unwrap();
         self.table_components = Some(column.get_data_ptr());
-        self.table_ticks = Some(column.get_ticks_slice().into());
+        self.table_added_ticks = Some(column.get_added_ticks_slice().into());
+        self.table_changed_ticks = Some(column.get_changed_ticks_slice().into());
     }
 
     #[inline]
     unsafe fn fetch(&mut self, entity: Entity, table_row: usize) -> FetchResult<'w> {
         match self.storage_type {
             StorageType::Table => {
-                let (table_components, table_ticks) =
-                    self.table_components.zip(self.table_ticks).unwrap();
+                let ((table_components, table_added_ticks), table_changed_ticks) = self
+                    .table_components
+                    .zip(self.table_added_ticks)
+                    .zip(self.table_changed_ticks)
+                    .unwrap();
                 let value = table_components.byte_add(table_row * self.component_size);
-                let component_ticks = table_ticks.get(table_row);
+                let component_added_ticks = table_added_ticks.get(table_row);
+                let component_changed_ticks = table_changed_ticks.get(table_row);
                 match self.fetch_kind {
                     FetchKind::Ref(_) => FetchResult::Ref(value),
                     FetchKind::RefMut(_) => FetchResult::RefMut {
                         value: value.assert_unique(),
-                        ticks: component_ticks.deref_mut(),
+                        added_ticks: component_added_ticks.deref_mut(),
+                        changed_ticks: component_changed_ticks.deref_mut(),
                         last_change_tick: self.last_change_tick,
                         change_tick: self.change_tick,
                     },
@@ -256,9 +266,14 @@ impl<'w> ComponentFetchState<'w> {
             }
             StorageType::SparseSet => match self.storage_type {
                 StorageType::Table => {
-                    let (entity_table_rows, (table_components, table_ticks)) = self
+                    let (
+                        ((entity_table_rows, table_components), table_added_ticks),
+                        table_changed_ticks,
+                    ) = self
                         .entity_table_rows
-                        .zip(self.table_components.zip(self.table_ticks))
+                        .zip(self.table_components)
+                        .zip(self.table_added_ticks)
+                        .zip(self.table_changed_ticks)
                         .unwrap();
                     let table_row = *entity_table_rows.get(table_row);
                     let value = table_components.byte_add(table_row * self.component_size);
@@ -266,10 +281,14 @@ impl<'w> ComponentFetchState<'w> {
                     match self.fetch_kind {
                         FetchKind::Ref(_) => FetchResult::Ref(value),
                         FetchKind::RefMut(_) => {
-                            let component_ticks = table_ticks.get(table_row).deref_mut();
+                            let component_added_ticks =
+                                table_added_ticks.get(table_row).deref_mut();
+                            let component_changed_ticks =
+                                table_changed_ticks.get(table_row).deref_mut();
                             FetchResult::RefMut {
                                 value: value.assert_unique(),
-                                ticks: component_ticks,
+                                added_ticks: component_added_ticks,
+                                changed_ticks: component_changed_ticks,
                                 last_change_tick: self.last_change_tick,
                                 change_tick: self.change_tick,
                             }
@@ -279,11 +298,14 @@ impl<'w> ComponentFetchState<'w> {
                 StorageType::SparseSet => {
                     let sparse_set = self.sparse_set.unwrap();
                     let (value, component_ticks) = sparse_set.get_with_ticks(entity).unwrap();
+                    let added_ticks = component_ticks.added;
+                    let changed_ticks = component_ticks.changed;
                     match self.fetch_kind {
                         FetchKind::Ref(_) => FetchResult::Ref(value),
                         FetchKind::RefMut(_) => FetchResult::RefMut {
                             value: value.assert_unique(),
-                            ticks: component_ticks.deref_mut(),
+                            added_ticks: added_ticks.deref_mut(),
+                            changed_ticks: changed_ticks.deref_mut(),
                             last_change_tick: self.last_change_tick,
                             change_tick: self.change_tick,
                         },
@@ -353,7 +375,8 @@ impl<'w> ComponentFetchStates<'w> {
 }
 
 struct ComponentFilterChangeDetection<'w> {
-    table_ticks: Option<ThinSlicePtr<'w, UnsafeCell<ComponentTicks>>>,
+    table_added_ticks: Option<ThinSlicePtr<'w, UnsafeCell<Tick>>>,
+    table_changed_ticks: Option<ThinSlicePtr<'w, UnsafeCell<Tick>>>,
     entities: Option<ThinSlicePtr<'w, ArchetypeEntity>>,
     sparse_set: Option<&'w ComponentSparseSet>,
     last_change_tick: u32,
@@ -361,27 +384,39 @@ struct ComponentFilterChangeDetection<'w> {
 }
 
 impl<'w> ComponentFilterChangeDetection<'w> {
-    unsafe fn archetype_ticks(
+    unsafe fn archetype_added_ticks(
         &self,
         storage_type: StorageType,
         entity: Entity,
         table_row: usize,
-    ) -> ComponentTicks {
+    ) -> Tick {
         match storage_type {
-            StorageType::Table => {
-                let ticks = *self.table_ticks.unwrap().get(table_row).deref();
-                ticks
-            }
-            StorageType::SparseSet => {
-                let ticks = self
-                    .sparse_set
-                    .unwrap()
-                    .get_ticks(entity)
-                    .map(|ticks| &*ticks.get())
-                    .cloned()
-                    .unwrap();
-                ticks
-            }
+            StorageType::Table => *self.table_added_ticks.unwrap().get(table_row).deref(),
+            StorageType::SparseSet => self
+                .sparse_set
+                .unwrap()
+                .get_added_ticks(entity)
+                .unwrap()
+                .deref()
+                .clone(),
+        }
+    }
+
+    unsafe fn archetype_changed_ticks(
+        &self,
+        storage_type: StorageType,
+        entity: Entity,
+        table_row: usize,
+    ) -> Tick {
+        match storage_type {
+            StorageType::Table => *self.table_changed_ticks.unwrap().get(table_row).deref(),
+            StorageType::SparseSet => self
+                .sparse_set
+                .unwrap()
+                .get_changed_ticks(entity)
+                .unwrap()
+                .deref()
+                .clone(),
         }
     }
 }
@@ -406,7 +441,8 @@ impl<'w> ComponentFilterState<'w> {
             storage_type: component_info.storage_type(),
             kind,
             change_detection: ComponentFilterChangeDetection {
-                table_ticks: None,
+                table_added_ticks: None,
+                table_changed_ticks: None,
                 entities: None,
                 sparse_set: (component_info.storage_type() == StorageType::SparseSet)
                     .then(|| world.storages().sparse_sets.get(component_id).unwrap()),
@@ -420,14 +456,29 @@ impl<'w> ComponentFilterState<'w> {
     unsafe fn set_archetype(&mut self, archetype: &'w Archetype, tables: &'w Tables) {
         match self.kind {
             FilterKind::With(_) | FilterKind::Without(_) => {}
-            FilterKind::Changed(_) | FilterKind::Added(_) => match self.storage_type {
+            FilterKind::Added(_) => match self.storage_type {
                 StorageType::Table => {
                     let table = &tables[archetype.table_id()];
-                    self.change_detection.table_ticks = Some(
+                    self.change_detection.table_added_ticks = Some(
                         table
                             .get_column(self.component_id)
                             .unwrap()
-                            .get_ticks_slice()
+                            .get_added_ticks_slice()
+                            .into(),
+                    );
+                }
+                StorageType::SparseSet => {
+                    self.change_detection.entities = Some(archetype.entities().into());
+                }
+            },
+            FilterKind::Changed(_) => match self.storage_type {
+                StorageType::Table => {
+                    let table = &tables[archetype.table_id()];
+                    self.change_detection.table_changed_ticks = Some(
+                        table
+                            .get_column(self.component_id)
+                            .unwrap()
+                            .get_changed_ticks_slice()
                             .into(),
                     );
                 }
@@ -442,12 +493,21 @@ impl<'w> ComponentFilterState<'w> {
     unsafe fn set_table(&mut self, table: &'w Table) {
         match self.kind {
             FilterKind::With(_) | FilterKind::Without(_) => {}
-            FilterKind::Changed(_) | FilterKind::Added(_) => {
-                self.change_detection.table_ticks = Some(
+            FilterKind::Added(_) => {
+                self.change_detection.table_added_ticks = Some(
                     table
                         .get_column(self.component_id)
                         .unwrap()
-                        .get_ticks_slice()
+                        .get_added_ticks_slice()
+                        .into(),
+                );
+            }
+            FilterKind::Changed(_) => {
+                self.change_detection.table_changed_ticks = Some(
+                    table
+                        .get_column(self.component_id)
+                        .unwrap()
+                        .get_changed_ticks_slice()
                         .into(),
                 );
             }
@@ -459,24 +519,38 @@ impl<'w> ComponentFilterState<'w> {
         match self.storage_type {
             StorageType::Table => match self.kind {
                 FilterKind::With(_) | FilterKind::Without(_) => true,
-                FilterKind::Changed(_) => ComponentTicks::is_changed(
-                    (self.change_detection.table_ticks.unwrap().get(table_row)).deref(),
-                    self.change_detection.last_change_tick,
-                    self.change_detection.change_tick,
-                ),
-                FilterKind::Added(_) => ComponentTicks::is_added(
-                    (self.change_detection.table_ticks.unwrap().get(table_row)).deref(),
-                    self.change_detection.last_change_tick,
-                    self.change_detection.change_tick,
-                ),
+                FilterKind::Changed(_) => {
+                    let tick = self
+                        .change_detection
+                        .table_changed_ticks
+                        .unwrap()
+                        .get(table_row)
+                        .deref();
+                    tick.is_newer_than(
+                        self.change_detection.last_change_tick,
+                        self.change_detection.change_tick,
+                    )
+                }
+                FilterKind::Added(_) => {
+                    let tick = self
+                        .change_detection
+                        .table_added_ticks
+                        .unwrap()
+                        .get(table_row)
+                        .deref();
+                    tick.is_newer_than(
+                        self.change_detection.last_change_tick,
+                        self.change_detection.change_tick,
+                    )
+                }
             },
             StorageType::SparseSet => match self.kind {
                 FilterKind::With(_) | FilterKind::Without(_) => true,
                 FilterKind::Changed(_) => {
                     let ticks =
                         self.change_detection
-                            .archetype_ticks(self.storage_type, entity, table_row);
-                    ticks.is_changed(
+                            .archetype_changed_ticks(self.storage_type, entity, table_row);
+                    ticks.is_newer_than(
                         self.change_detection.last_change_tick,
                         self.change_detection.change_tick,
                     )
@@ -484,8 +558,8 @@ impl<'w> ComponentFilterState<'w> {
                 FilterKind::Added(_) => {
                     let ticks =
                         self.change_detection
-                            .archetype_ticks(self.storage_type, entity, table_row);
-                    ticks.is_added(
+                            .archetype_added_ticks(self.storage_type, entity, table_row);
+                    ticks.is_newer_than(
                         self.change_detection.last_change_tick,
                         self.change_detection.change_tick,
                     )
